@@ -1,6 +1,6 @@
 use anyhow::Result;
-use std::net::TcpListener;
-use tracing::{error, info};
+use quoteapp::server::Server;
+use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 #[derive(clap::Parser, Debug)]
@@ -23,18 +23,10 @@ fn main() -> Result<()> {
             args.port
         );
     }
+    let mut server = Server::new(args.port);
+    server.run()?;
 
-    let listener = TcpListener::bind(("0.0.0.0", args.port))?;
-    info!("listening on {}", listener.local_addr()?);
-
-    for stream in listener.incoming() {
-        match stream {
-            Ok(stream) => {
-                info!("accepted a new stream");
-            }
-            Err(e) => error!("connection failed: {}", e),
-        }
-    }
+    info!("server terminated");
 
     Ok(())
 }
