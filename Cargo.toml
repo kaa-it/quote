@@ -11,6 +11,7 @@ clap = { version = "4", features = ["derive"] }
 tracing = { version = "0.1" }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 ctrlc = "3"
+log = "0.4.29"
 
 [[bin]]
 name = "server"

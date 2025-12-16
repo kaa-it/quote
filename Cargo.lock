@@ -308,6 +308,7 @@ dependencies = [
  "anyhow",
  "clap",
  "ctrlc",
+ "log",
  "rand",
  "thiserror",
  "tracing",

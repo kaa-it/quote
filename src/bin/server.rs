@@ -1,5 +1,6 @@
 use anyhow::Result;
 use quoteapp::server::Server;
+use std::sync::Arc;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 

@@ -1,15 +1,15 @@
 mod error;
 
 use crate::server::error::ServerError;
-use rand::Rng;
+use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{TcpListener, TcpStream, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::thread::JoinHandle;
 use std::time::Duration;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 pub struct Server {
     port: u16,
@@ -82,6 +82,9 @@ impl Server {
         let _ = writer.write_all(b"Welcome to the Quote Server!\n");
         let _ = writer.flush();
 
+        let mut streamers: Vec<JoinHandle<Result<(), crate::server::error::ServerError>>> =
+            Vec::new();
+
         let mut line = String::new();
         while running.load(Ordering::SeqCst) {
             line.clear();
@@ -100,41 +103,38 @@ impl Server {
                     let mut parts = input.split_whitespace();
                     let response = match parts.next() {
                         Some("STREAM") => {
-                            // let id = parts.next().and_then(|s| s.parse::<u32>().ok());
-                            // let name = parts.next();
-                            // let size = parts.next().and_then(|s| s.parse::<u32>().ok());
-                            //
-                            // if let (Some(id), Some(name), Some(size)) = (id, name, size) {
-                            //     let item = Item {
-                            //         name: name.to_string(),
-                            //         size,
-                            //     };
-                            //     let mut v = vault.lock().unwrap();
-                            //     match v.put(id, item, 100) {
-                            //         Ok(_) => "OK: item stored\n".to_string(),
-                            //         Err(VaultError::VaultFull) => "ERROR: vault full\n".to_string(),
-                            //         Err(VaultError::CellFull) => "ERROR: cell full\n".to_string(),
-                            //         _ => "ERROR: unknown\n".to_string(),
-                            //     }
-                            // } else {
-                            //     "ERROR: usage PUT <id> <name> <size>\n".to_string()
-                            // }
-                            "STREAM: command received!\n".to_string()
+                            let address = parts.next();
+                            let tickers = parts.next();
+                            let socket = Arc::new(UdpSocket::bind("localhost:0")?);
+                            socket.set_nonblocking(true)?;
+                            info!("{}", socket.local_addr()?);
+
+                            if let (Some(address), Some(tickers)) = (address, tickers) {
+                                streamers.push(thread::spawn({
+                                    let running = running.clone();
+                                    let address = address.to_string();
+                                    let socket = socket.clone();
+                                    let tickers =
+                                        HashSet::from_iter(tickers.split(',').map(String::from));
+                                    move || {
+                                        Self::handle_streaming(socket, address, tickers, running)
+                                    }
+                                }));
+                                streamers.push(thread::spawn({
+                                    let running = running.clone();
+                                    let address = address.to_string();
+                                    move || Self::handle_ping(socket, address, running)
+                                }));
+                                format!("OK: streaming to {} for {}", address, tickers)
+                            } else {
+                                "ERROR: usage STREAM host:port ticker1,ticker2".to_string()
+                            }
                         }
 
                         Some("EXIT") => {
                             let _ = writer.write_all(b"BYE\n");
                             let _ = writer.flush();
                             break;
-                        }
-
-                        Some("PING") => {
-                            let mut rng = rand::rng();
-
-                            // Случайная задержка от 1 до 5 секунд
-                            let delay_secs = rng.random_range(1..=5);
-                            std::thread::sleep(Duration::from_secs(delay_secs));
-                            "PONG\n".to_string()
                         }
 
                         _ => "ERROR: unknown command\n".to_string(),
@@ -154,12 +154,71 @@ impl Server {
             }
         }
 
+        for handle in streamers.drain(..) {
+            if let Err(e) = handle.join() {
+                error!("streamer thread failed: {:?}", e);
+            }
+        }
+
         if !running.load(Ordering::SeqCst) {
             let _ = writer.write_all(b"BYE\n");
             let _ = writer.flush();
         }
 
         info!("connection terminated");
+
+        Ok(())
+    }
+
+    fn handle_streaming(
+        socket: Arc<UdpSocket>,
+        address: String,
+        tickers: HashSet<String>,
+        running: Arc<AtomicBool>,
+    ) -> Result<(), ServerError> {
+        while running.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_secs(1));
+        }
+
+        info!("stream ended");
+
+        Ok(())
+    }
+
+    fn handle_ping(
+        socket: Arc<UdpSocket>,
+        address: String,
+        running: Arc<AtomicBool>,
+    ) -> Result<(), ServerError> {
+        let mut buf = [0u8; 1024];
+
+        info!("ping stream started for {}", address);
+
+        while running.load(Ordering::SeqCst) {
+            match socket.recv_from(&mut buf) {
+                Ok((amount, src)) => {
+                    let message = String::from_utf8_lossy(&buf[..amount]);
+                    info!("received from {}: {}", src, message);
+                    if message == "PING\n" {
+                        if let Err(e) = socket.send_to(b"PONG\n", &address) {
+                            warn!("failed to send pong: {:?}", e);
+                        }
+                    } else {
+                        warn!("received unexpected message: {}", message);
+                    }
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                Err(e) => {
+                    // ошибка чтения — закрываем
+                    warn!("error receiving from {}: {}", address, e);
+                    break;
+                }
+            }
+        }
+
+        info!("ping stream ended for {}", address);
 
         Ok(())
     }
