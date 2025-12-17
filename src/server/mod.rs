@@ -13,6 +13,8 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use tracing::{error, info, warn};
 
+static PING_MAX_TIMEOUT_SECS: u64 = 2;
+
 pub struct Server {
     port: u16,
     running: Arc<AtomicBool>,
@@ -318,7 +320,7 @@ impl Server {
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     let elapsed = start.elapsed().as_secs();
 
-                    if elapsed > 2 {
+                    if elapsed > PING_MAX_TIMEOUT_SECS {
                         warn!("ping timeout");
                         streaming_flag.store(false, Ordering::SeqCst);
                         break;
