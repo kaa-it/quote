@@ -1,20 +1,23 @@
 mod error;
 
+use crate::quote::{self, QuoteGenerator, StockQuote};
 use crate::server::error::ServerError;
+use crossbeam::channel::{Receiver, Sender, TryRecvError, TrySendError};
 use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream, UdpSocket};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::thread::JoinHandle;
 use std::time::Duration;
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
 pub struct Server {
     port: u16,
     running: Arc<AtomicBool>,
     clients: Vec<JoinHandle<Result<(), ServerError>>>,
+    generator_thread: Option<JoinHandle<Result<(), ServerError>>>,
 }
 
 impl Server {
@@ -23,6 +26,7 @@ impl Server {
             port,
             running: Arc::new(AtomicBool::new(true)),
             clients: Vec::new(),
+            generator_thread: None,
         }
     }
 
@@ -33,13 +37,18 @@ impl Server {
 
         self.register_ctrlc()?;
 
+        let (sender, receiver) = crossbeam::channel::bounded::<StockQuote>(1);
+
+        self.run_generator(sender)?;
+
         for stream in listener.incoming() {
             match stream {
                 Ok(stream) => {
-                    info!("accepted a new stream");
+                    info!("accepted a new stream from {}", stream.peer_addr()?);
                     self.clients.push(thread::spawn({
                         let running = self.running.clone();
-                        move || Self::handle_connection(stream, running)
+                        let quote_receiver = receiver.clone();
+                        move || Self::handle_connection(stream, running, quote_receiver)
                     }));
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -50,6 +59,10 @@ impl Server {
                 }
                 Err(e) => error!("connection failed: {}", e),
             }
+        }
+
+        if let Err(e) = self.generator_thread.take().unwrap().join() {
+            error!("generator thread failed: {:?}", e);
         }
 
         for handle in self.clients.drain(..) {
@@ -63,6 +76,45 @@ impl Server {
 }
 
 impl Server {
+    fn run_generator(&mut self, sender: Sender<StockQuote>) -> Result<(), ServerError> {
+        let running = self.running.clone();
+
+        self.generator_thread = Some(std::thread::spawn(move || {
+            let mut generator = QuoteGenerator::new();
+
+            // not optimal, but it enables interrupt thread
+            'outer: while running.load(Ordering::SeqCst) {
+                // Generate stock quotes and send them through the channel
+                std::thread::sleep(Duration::from_millis(500));
+                let ticker = QuoteGenerator::random_ticker();
+                let quote = match generator.generate_quote(ticker) {
+                    Ok(quote) => quote,
+                    Err(e) => {
+                        error!("failed to generate quote: {}", e);
+                        continue;
+                    }
+                };
+                info!("generated quote: {}", quote.to_string());
+                while running.load(Ordering::SeqCst) {
+                    let quote = quote.clone();
+                    match sender.try_send(quote) {
+                        Ok(_) => break,
+                        Err(TrySendError::Disconnected(_)) => break 'outer,
+                        Err(TrySendError::Full(_)) => {
+                            std::thread::sleep(Duration::from_millis(500))
+                        } // try again after a short delay,
+                    }
+                }
+            }
+
+            info!("generator thread terminated");
+
+            Ok(())
+        }));
+
+        Ok(())
+    }
+
     fn register_ctrlc(&self) -> Result<(), ctrlc::Error> {
         let r = self.running.clone();
 
@@ -74,7 +126,11 @@ impl Server {
         Ok(())
     }
 
-    fn handle_connection(stream: TcpStream, running: Arc<AtomicBool>) -> Result<(), ServerError> {
+    fn handle_connection(
+        stream: TcpStream,
+        running: Arc<AtomicBool>,
+        quote_receiver: Receiver<StockQuote>,
+    ) -> Result<(), ServerError> {
         stream.set_nonblocking(true)?;
         let mut writer = stream.try_clone()?;
         let mut reader = BufReader::new(stream);
@@ -86,11 +142,13 @@ impl Server {
             Vec::new();
 
         let mut line = String::new();
+
+        // not optimal, but it enables interrupt thread
         while running.load(Ordering::SeqCst) {
             line.clear();
             match reader.read_line(&mut line) {
                 Ok(0) => {
-                    // EOF — клиент закрыл соединение
+                    // EOF — client closed connection
                     break;
                 }
                 Ok(_) => {
@@ -114,10 +172,17 @@ impl Server {
                                     let running = running.clone();
                                     let address = address.to_string();
                                     let socket = socket.clone();
+                                    let quote_receiver = quote_receiver.clone();
                                     let tickers =
                                         HashSet::from_iter(tickers.split(',').map(String::from));
                                     move || {
-                                        Self::handle_streaming(socket, address, tickers, running)
+                                        Self::handle_streaming(
+                                            socket,
+                                            address,
+                                            tickers,
+                                            running,
+                                            quote_receiver,
+                                        )
                                     }
                                 }));
                                 streamers.push(thread::spawn({
@@ -140,7 +205,7 @@ impl Server {
                         _ => "ERROR: unknown command\n".to_string(),
                     };
 
-                    // отправляем ответ и снова показываем prompt
+                    // sending response and again showing prompt
                     let _ = writer.write_all(response.as_bytes());
                     let _ = writer.flush();
                 }
@@ -148,7 +213,7 @@ impl Server {
                     std::thread::sleep(std::time::Duration::from_millis(100));
                 }
                 Err(_) => {
-                    // ошибка чтения — закрываем
+                    // reading error - close connection
                     break;
                 }
             }
@@ -175,12 +240,34 @@ impl Server {
         address: String,
         tickers: HashSet<String>,
         running: Arc<AtomicBool>,
+        quote_receiver: Receiver<StockQuote>,
     ) -> Result<(), ServerError> {
+        info!("streaming started for {}", address);
+
         while running.load(Ordering::SeqCst) {
-            std::thread::sleep(Duration::from_secs(1));
+            match quote_receiver.try_recv() {
+                Ok(quote) => {
+                    info!("checking ticker of quote: {}", quote.to_string());
+                    if !tickers.contains(quote.ticker.as_str()) {
+                        continue;
+                    }
+                    let message = format!("QUOTE {}\n", quote.to_string());
+                    if let Err(e) = socket.send_to(message.as_bytes(), &address) {
+                        error!("failed to send quote to {}: {}", address, e);
+                        break;
+                    }
+                    info!("quote {} sent to {}", quote.to_string(), address);
+                }
+                Err(TryRecvError::Empty) => {
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                Err(TryRecvError::Disconnected) => {
+                    break;
+                }
+            }
         }
 
-        info!("stream ended");
+        info!("sender stream ended for {}", address);
 
         Ok(())
     }
@@ -194,6 +281,7 @@ impl Server {
 
         info!("ping stream started for {}", address);
 
+        // not optimal, but it enables interrupt thread
         while running.load(Ordering::SeqCst) {
             match socket.recv_from(&mut buf) {
                 Ok((amount, src)) => {
@@ -201,18 +289,18 @@ impl Server {
                     info!("received from {}: {}", src, message);
                     if message == "PING\n" {
                         if let Err(e) = socket.send_to(b"PONG\n", &address) {
-                            warn!("failed to send pong: {:?}", e);
+                            error!("failed to send pong: {:?}", e);
                         }
                     } else {
-                        warn!("received unexpected message: {}", message);
+                        error!("received unexpected message: {}", message);
                     }
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     std::thread::sleep(std::time::Duration::from_millis(100));
                 }
                 Err(e) => {
-                    // ошибка чтения — закрываем
-                    warn!("error receiving from {}: {}", address, e);
+                    // reading error - interrupt thread
+                    error!("error receiving from {}: {}", address, e);
                     break;
                 }
             }

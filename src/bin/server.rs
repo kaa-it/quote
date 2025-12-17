@@ -1,6 +1,5 @@
 use anyhow::Result;
 use quoteapp::server::Server;
-use std::sync::Arc;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
@@ -24,6 +23,7 @@ fn main() -> Result<()> {
             args.port
         );
     }
+
     let mut server = Server::new(args.port);
     server.run()?;
 

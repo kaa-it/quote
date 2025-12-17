@@ -1,3 +1,4 @@
+use rand::prelude::*;
 use std::collections::HashSet;
 use std::sync::LazyLock;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -81,6 +82,11 @@ impl QuoteGenerator {
         Self {
             last_price: START_PRICE,
         }
+    }
+
+    pub fn random_ticker() -> &'static str {
+        let mut rng = rand::rng();
+        SUPPORTED_TICKERS.iter().choose(&mut rng).unwrap()
     }
 
     pub fn generate_quote(&mut self, ticker: &str) -> Result<StockQuote, QuoteGeneratorError> {
