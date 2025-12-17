@@ -1,17 +1,17 @@
 mod error;
 
-use crate::quote::{self, QuoteGenerator, StockQuote};
+use crate::quote::{QuoteGenerator, StockQuote};
 use crate::server::error::ServerError;
 use crossbeam::channel::{Receiver, Sender, TryRecvError, TrySendError};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Write};
-use std::net::{TcpListener, TcpStream, UdpSocket};
+use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::thread::JoinHandle;
-use std::time::Duration;
-use tracing::{error, info};
+use std::time::{Duration, Instant};
+use tracing::{error, info, warn};
 
 pub struct Server {
     port: u16,
@@ -44,7 +44,8 @@ impl Server {
         for stream in listener.incoming() {
             match stream {
                 Ok(stream) => {
-                    info!("accepted a new stream from {}", stream.peer_addr()?);
+                    let peer_address = stream.peer_addr()?;
+                    info!("accepted a new stream from {}", peer_address);
                     self.clients.push(thread::spawn({
                         let running = self.running.clone();
                         let quote_receiver = receiver.clone();
@@ -143,6 +144,9 @@ impl Server {
 
         let mut line = String::new();
 
+        // flag to interrupt streaming by PING checking
+        let streaming_flag = Arc::new(AtomicBool::new(true));
+
         // not optimal, but it enables interrupt thread
         while running.load(Ordering::SeqCst) {
             line.clear();
@@ -167,12 +171,15 @@ impl Server {
                             socket.set_nonblocking(true)?;
                             info!("{}", socket.local_addr()?);
 
+                            streaming_flag.store(true, Ordering::SeqCst);
+
                             if let (Some(address), Some(tickers)) = (address, tickers) {
                                 streamers.push(thread::spawn({
                                     let running = running.clone();
                                     let address = address.to_string();
                                     let socket = socket.clone();
                                     let quote_receiver = quote_receiver.clone();
+                                    let streaming_flag = streaming_flag.clone();
                                     let tickers =
                                         HashSet::from_iter(tickers.split(',').map(String::from));
                                     move || {
@@ -182,17 +189,21 @@ impl Server {
                                             tickers,
                                             running,
                                             quote_receiver,
+                                            streaming_flag,
                                         )
                                     }
                                 }));
                                 streamers.push(thread::spawn({
                                     let running = running.clone();
                                     let address = address.to_string();
-                                    move || Self::handle_ping(socket, address, running)
+                                    let streaming_flag = streaming_flag.clone();
+                                    move || {
+                                        Self::handle_ping(socket, address, running, streaming_flag)
+                                    }
                                 }));
-                                format!("OK: streaming to {} for {}", address, tickers)
+                                format!("OK: streaming to {} for {}\n", address, tickers)
                             } else {
-                                "ERROR: usage STREAM host:port ticker1,ticker2".to_string()
+                                "ERROR: usage STREAM host:port ticker1,ticker2\n".to_string()
                             }
                         }
 
@@ -241,10 +252,11 @@ impl Server {
         tickers: HashSet<String>,
         running: Arc<AtomicBool>,
         quote_receiver: Receiver<StockQuote>,
+        streaming_flag: Arc<AtomicBool>,
     ) -> Result<(), ServerError> {
         info!("streaming started for {}", address);
 
-        while running.load(Ordering::SeqCst) {
+        while running.load(Ordering::SeqCst) && streaming_flag.load(Ordering::SeqCst) {
             match quote_receiver.try_recv() {
                 Ok(quote) => {
                     info!("checking ticker of quote: {}", quote.to_string());
@@ -267,6 +279,10 @@ impl Server {
             }
         }
 
+        if let Err(e) = socket.send_to(b"BYE\n", &address) {
+            error!("failed to send BYE to {}: {}", address, e);
+        }
+
         info!("sender stream ended for {}", address);
 
         Ok(())
@@ -276,10 +292,13 @@ impl Server {
         socket: Arc<UdpSocket>,
         address: String,
         running: Arc<AtomicBool>,
+        streaming_flag: Arc<AtomicBool>,
     ) -> Result<(), ServerError> {
         let mut buf = [0u8; 1024];
 
         info!("ping stream started for {}", address);
+
+        let mut start = Instant::now();
 
         // not optimal, but it enables interrupt thread
         while running.load(Ordering::SeqCst) {
@@ -288,6 +307,7 @@ impl Server {
                     let message = String::from_utf8_lossy(&buf[..amount]);
                     info!("received from {}: {}", src, message);
                     if message == "PING\n" {
+                        start = Instant::now();
                         if let Err(e) = socket.send_to(b"PONG\n", &address) {
                             error!("failed to send pong: {:?}", e);
                         }
@@ -296,6 +316,14 @@ impl Server {
                     }
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    let elapsed = start.elapsed().as_secs();
+
+                    if elapsed > 2 {
+                        warn!("ping timeout");
+                        streaming_flag.store(false, Ordering::SeqCst);
+                        break;
+                    }
+
                     std::thread::sleep(std::time::Duration::from_millis(100));
                 }
                 Err(e) => {
