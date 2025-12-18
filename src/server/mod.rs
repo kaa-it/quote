@@ -13,7 +13,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use tracing::{error, info, warn};
 
-static PING_MAX_TIMEOUT_SECS: u64 = 2;
+static PING_MAX_TIMEOUT_SECS: u64 = 5;
 
 pub struct Server {
     port: u16,
@@ -55,7 +55,7 @@ impl Server {
                     }));
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    thread::sleep(Duration::from_millis(100));
                     if !self.running.load(Ordering::SeqCst) {
                         break;
                     }
@@ -82,13 +82,13 @@ impl Server {
     fn run_generator(&mut self, sender: Sender<StockQuote>) -> Result<(), ServerError> {
         let running = self.running.clone();
 
-        self.generator_thread = Some(std::thread::spawn(move || {
+        self.generator_thread = Some(thread::spawn(move || {
             let mut generator = QuoteGenerator::new();
 
             // not optimal, but it enables interrupt thread
             'outer: while running.load(Ordering::SeqCst) {
                 // Generate stock quotes and send them through the channel
-                std::thread::sleep(Duration::from_millis(500));
+                thread::sleep(Duration::from_millis(500));
                 let ticker = QuoteGenerator::random_ticker();
                 let quote = match generator.generate_quote(ticker) {
                     Ok(quote) => quote,
@@ -104,7 +104,7 @@ impl Server {
                         Ok(_) => break,
                         Err(TrySendError::Disconnected(_)) => break 'outer,
                         Err(TrySendError::Full(_)) => {
-                            std::thread::sleep(Duration::from_millis(500))
+                            thread::sleep(Duration::from_millis(500))
                         } // try again after a short delay,
                     }
                 }
@@ -141,7 +141,10 @@ impl Server {
         let _ = writer.write_all(b"Welcome to the Quote Server!\n");
         let _ = writer.flush();
 
-        let mut streamers: Vec<JoinHandle<Result<(), crate::server::error::ServerError>>> =
+        let mut streamers: Vec<JoinHandle<Result<(), ServerError>>> =
+            Vec::new();
+
+        let mut pingers: Vec<Arc<JoinHandle<Result<(), ServerError>>>> =
             Vec::new();
 
         let mut line = String::new();
@@ -169,17 +172,27 @@ impl Server {
                         Some("STREAM") => {
                             let address = parts.next();
                             let tickers = parts.next();
-                            let socket = Arc::new(UdpSocket::bind("localhost:0")?);
+                            let socket = Arc::new(UdpSocket::bind("127.0.0.1:0")?);
                             socket.set_nonblocking(true)?;
-                            info!("{}", socket.local_addr()?);
 
                             streaming_flag.store(true, Ordering::SeqCst);
 
                             if let (Some(address), Some(tickers)) = (address, tickers) {
-                                streamers.push(thread::spawn({
+                                let pinger_handle = Arc::new(thread::spawn({
                                     let running = running.clone();
                                     let address = address.to_string();
                                     let socket = socket.clone();
+                                    let streaming_flag = streaming_flag.clone();
+                                    move || {
+                                        Self::handle_ping(socket, address, running, streaming_flag)
+                                    }
+                                }));
+
+                                pingers.push(pinger_handle.clone());
+
+                                streamers.push(thread::spawn({
+                                    let running = running.clone();
+                                    let address = address.to_string();
                                     let quote_receiver = quote_receiver.clone();
                                     let streaming_flag = streaming_flag.clone();
                                     let tickers =
@@ -192,15 +205,8 @@ impl Server {
                                             running,
                                             quote_receiver,
                                             streaming_flag,
+                                            pinger_handle
                                         )
-                                    }
-                                }));
-                                streamers.push(thread::spawn({
-                                    let running = running.clone();
-                                    let address = address.to_string();
-                                    let streaming_flag = streaming_flag.clone();
-                                    move || {
-                                        Self::handle_ping(socket, address, running, streaming_flag)
                                     }
                                 }));
                                 format!("OK: streaming to {} for {}\n", address, tickers)
@@ -223,7 +229,7 @@ impl Server {
                     let _ = writer.flush();
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    thread::sleep(Duration::from_millis(100));
                 }
                 Err(_) => {
                     // reading error - close connection
@@ -235,6 +241,14 @@ impl Server {
         for handle in streamers.drain(..) {
             if let Err(e) = handle.join() {
                 error!("streamer thread failed: {:?}", e);
+            }
+        }
+
+        for handle in pingers.drain(..) {
+            if let Ok(handle) = Arc::try_unwrap(handle) {
+                if let Err(e) = handle.join() {
+                    error!("streamer thread failed: {:?}", e);
+                }
             }
         }
 
@@ -255,8 +269,11 @@ impl Server {
         running: Arc<AtomicBool>,
         quote_receiver: Receiver<StockQuote>,
         streaming_flag: Arc<AtomicBool>,
+        pinger_handle: Arc<JoinHandle<Result<(), ServerError>>>,
     ) -> Result<(), ServerError> {
         info!("streaming started for {}", address);
+
+        let mut first_quote_sent = false;
 
         while running.load(Ordering::SeqCst) && streaming_flag.load(Ordering::SeqCst) {
             match quote_receiver.try_recv() {
@@ -271,9 +288,14 @@ impl Server {
                         break;
                     }
                     info!("quote {} sent to {}", quote.to_string(), address);
+                    if !first_quote_sent {
+                        first_quote_sent = true;
+                        info!("!!!! first quote sent to {} -> unpark", address);
+                        pinger_handle.thread().unpark();
+                    }
                 }
                 Err(TryRecvError::Empty) => {
-                    std::thread::sleep(Duration::from_millis(100));
+                    thread::sleep(Duration::from_millis(100));
                 }
                 Err(TryRecvError::Disconnected) => {
                     break;
@@ -284,6 +306,8 @@ impl Server {
         if let Err(e) = socket.send_to(b"BYE\n", &address) {
             error!("failed to send BYE to {}: {}", address, e);
         }
+
+        pinger_handle.thread().unpark();
 
         info!("sender stream ended for {}", address);
 
@@ -300,7 +324,11 @@ impl Server {
 
         info!("ping stream started for {}", address);
 
+        thread::park();
+
         let mut start = Instant::now();
+
+        info!("start checking ping for {}", address);
 
         // not optimal, but it enables interrupt thread
         while running.load(Ordering::SeqCst) {
@@ -326,7 +354,7 @@ impl Server {
                         break;
                     }
 
-                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    thread::sleep(Duration::from_millis(100));
                 }
                 Err(e) => {
                     // reading error - interrupt thread
